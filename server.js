@@ -1,7 +1,7 @@
 const express = require('express');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { Server } = require('socket.io');
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const Groq = require('groq-sdk');
 const qrcode = require('qrcode');
 const http = require('http');
 const cors = require('cors');
@@ -13,7 +13,7 @@ const io = new Server(server, { cors: { origin: '*' } });
 app.use(cors());
 app.use(express.json());
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 let botInstructions = 'Eres un asistente de servicio al cliente amable y profesional.';
 let clientWA = null;
 let currentState = 'disconnected';
@@ -70,15 +70,18 @@ function createClient() {
   clientWA.on('message', async (msg) => {
     if (msg.fromMe) return;
     try {
-      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-      const result = await model.generateContent(
-        `${botInstructions}\n\nMensaje del cliente: ${msg.body}\n\nRespuesta:`
-      );
-      const reply = result.response.text();
+      const result = await groq.chat.completions.create({
+        model: 'llama3-8b-8192',
+        messages: [
+          { role: 'system', content: botInstructions },
+          { role: 'user', content: msg.body }
+        ]
+      });
+      const reply = result.choices[0].message.content;
       await msg.reply(reply);
       console.log('Respondido a:', msg.from);
     } catch (err) {
-      console.error('Error Gemini:', err.message);
+      console.error('Error Groq:', err.message);
     }
   });
 
@@ -88,22 +91,14 @@ function createClient() {
   });
 }
 
-// ── Rutas API ──────────────────────────────────────────────
-
 app.post('/api/configure', (req, res) => {
   const { instructions } = req.body;
   if (!instructions) return res.status(400).json({ error: 'Instrucciones requeridas' });
-  
   botInstructions = instructions;
   console.log('Instrucciones actualizadas');
-
-  if (clientWA) {
-    clientWA.destroy().catch(() => {});
-    clientWA = null;
-  }
+  if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
-
   setTimeout(createClient, 1000);
   res.json({ ok: true });
 });
@@ -113,10 +108,7 @@ app.get('/api/status', (req, res) => {
 });
 
 app.post('/api/restart', (req, res) => {
-  if (clientWA) {
-    clientWA.destroy().catch(() => {});
-    clientWA = null;
-  }
+  if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
   setTimeout(createClient, 1000);
@@ -127,16 +119,11 @@ app.get('/', (req, res) => {
   res.json({ status: 'ColChat corriendo', state: currentState });
 });
 
-// ── Socket.io ──────────────────────────────────────────────
-
 io.on('connection', (socket) => {
   console.log('Cliente conectado al socket');
-  // Enviar estado actual al conectarse
   if (lastQR) socket.emit('update', { qr: lastQR, state: currentState });
   if (currentState === 'ready') socket.emit('update', { state: 'ready', info: lastInfo });
 });
-
-// ── Iniciar servidor ───────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
