@@ -70,7 +70,7 @@ function createClient() {
   clientWA.on('message', async (msg) => {
     if (msg.fromMe) return;
     try {
-      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
       const result = await model.generateContent(
         `${botInstructions}\n\nMensaje del cliente: ${msg.body}\n\nRespuesta:`
       );
