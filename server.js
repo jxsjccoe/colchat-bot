@@ -14,41 +14,96 @@ app.use(cors());
 app.use(express.json());
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-let botInstructions = 'Eres un asistente de servicio al cliente.';
+let botInstructions = 'Eres un asistente de servicio al cliente amable y profesional.';
 let clientWA = null;
 let currentState = 'disconnected';
 let lastQR = null;
 let lastInfo = null;
 
 function createClient() {
-  clientWA = new Client({ authStrategy: new LocalAuth(), puppeteer: { args: ['--no-sandbox'] } });
+  clientWA = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ]
+    }
+  });
 
   clientWA.on('qr', async (qr) => {
+    console.log('QR generado');
     lastQR = await qrcode.toDataURL(qr);
     currentState = 'qr';
     io.emit('update', { qr: lastQR, state: 'qr' });
   });
 
   clientWA.on('ready', () => {
+    console.log('WhatsApp conectado');
     currentState = 'ready';
     lastInfo = clientWA.info;
+    lastQR = null;
     io.emit('update', { state: 'ready', info: lastInfo });
+  });
+
+  clientWA.on('authenticated', () => {
+    console.log('Autenticado');
+    currentState = 'connecting';
+    io.emit('update', { state: 'connecting' });
+  });
+
+  clientWA.on('disconnected', (reason) => {
+    console.log('Desconectado:', reason);
+    currentState = 'disconnected';
+    lastQR = null;
+    io.emit('update', { state: 'disconnected' });
+    setTimeout(createClient, 3000);
   });
 
   clientWA.on('message', async (msg) => {
     if (msg.fromMe) return;
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
-    const result = await model.generateContent(`${botInstructions}\n\nCliente: ${msg.body}\nRespuesta:`);
-    msg.reply(result.response.text());
+    try {
+      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const result = await model.generateContent(
+        `${botInstructions}\n\nMensaje del cliente: ${msg.body}\n\nRespuesta:`
+      );
+      const reply = result.response.text();
+      await msg.reply(reply);
+      console.log('Respondido a:', msg.from);
+    } catch (err) {
+      console.error('Error Gemini:', err.message);
+    }
   });
 
-  clientWA.initialize();
+  clientWA.initialize().catch(err => {
+    console.error('Error inicializando cliente:', err.message);
+    setTimeout(createClient, 5000);
+  });
 }
 
+// ── Rutas API ──────────────────────────────────────────────
+
 app.post('/api/configure', (req, res) => {
-  botInstructions = req.body.instructions || botInstructions;
-  if (clientWA) clientWA.destroy().catch(() => {});
-  lastQR = null; currentState = 'disconnected';
+  const { instructions } = req.body;
+  if (!instructions) return res.status(400).json({ error: 'Instrucciones requeridas' });
+  
+  botInstructions = instructions;
+  console.log('Instrucciones actualizadas');
+
+  if (clientWA) {
+    clientWA.destroy().catch(() => {});
+    clientWA = null;
+  }
+  lastQR = null;
+  currentState = 'disconnected';
+
   setTimeout(createClient, 1000);
   res.json({ ok: true });
 });
@@ -58,10 +113,33 @@ app.get('/api/status', (req, res) => {
 });
 
 app.post('/api/restart', (req, res) => {
-  if (clientWA) clientWA.destroy().catch(() => {});
+  if (clientWA) {
+    clientWA.destroy().catch(() => {});
+    clientWA = null;
+  }
+  lastQR = null;
+  currentState = 'disconnected';
   setTimeout(createClient, 1000);
   res.json({ ok: true });
 });
 
-server.listen(process.env.PORT || 3000, () => console.log('Servidor activo'));
-createClient();
+app.get('/', (req, res) => {
+  res.json({ status: 'ColChat corriendo', state: currentState });
+});
+
+// ── Socket.io ──────────────────────────────────────────────
+
+io.on('connection', (socket) => {
+  console.log('Cliente conectado al socket');
+  // Enviar estado actual al conectarse
+  if (lastQR) socket.emit('update', { qr: lastQR, state: currentState });
+  if (currentState === 'ready') socket.emit('update', { state: 'ready', info: lastInfo });
+});
+
+// ── Iniciar servidor ───────────────────────────────────────
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Servidor activo en puerto ${PORT}`);
+  createClient();
+});
