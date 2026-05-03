@@ -32,8 +32,7 @@ const conversaciones = {};
 
 // ── Hora Bogotá (UTC-5, sin horario de verano) ───────────────────
 function getNowBogota() {
-  const nowUTC = new Date();
-  return new Date(nowUTC.getTime() + (-5 * 60 * 60000));
+  return new Date(new Date().getTime() + (-5 * 60 * 60000));
 }
 
 function getFechaBogota() {
@@ -174,7 +173,7 @@ function dentroDeHorario() {
   const inicio = hi * 60 + mi;
   const fin = hf * 60 + mf;
 
-  console.log(`🕐 Día: ${diaActual} | Hora Bogotá: ${String(now.getUTCHours()).padStart(2,'0')}:${String(now.getUTCMinutes()).padStart(2,'0')} | Rango: ${horario.inicio}-${horario.fin}`);
+  console.log(`🕐 Día: ${diaActual} | Hora Bogotá: ${String(now.getUTCHours()).padStart(2, '0')}:${String(now.getUTCMinutes()).padStart(2, '0')} | Rango: ${horario.inicio}-${horario.fin}`);
   console.log(`   Días activos: ${horario.dias.join(',')}`);
 
   return horario.dias.includes(diaActual) && horaActual >= inicio && horaActual <= fin;
@@ -289,6 +288,7 @@ function createClient() {
 
         const horaActual = getTimeBogota();
         if (!conversaciones[from]) conversaciones[from] = [];
+        // Guardar con time para el socket, pero se filtra antes de enviar a Groq
         conversaciones[from].push({ role: 'user', content: body, time: horaActual });
         io.emit('nuevoMensaje', { from, text: body, role: 'user', time: horaActual });
 
@@ -306,7 +306,8 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
 
           const messages = [
             { role: 'system', content: systemPrompt },
-            ...conversaciones[from].slice(-12)
+            // Filtrar 'time' — Groq solo acepta role y content
+            ...conversaciones[from].slice(-12).map(({ role, content }) => ({ role, content }))
           ];
 
           const result = await groq.chat.completions.create({ model: 'llama-3.3-70b-versatile', messages });
