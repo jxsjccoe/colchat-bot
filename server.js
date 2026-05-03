@@ -29,20 +29,19 @@ let botActive = true;
 let isCreatingClient = false;
 const conversaciones = {};
 
-// ── Firebase Admin (opcional) ────────────────────────────────────
-// Si tienes FIREBASE_SERVICE_ACCOUNT en Railway, se usa para guardar config/ventas.
-// Si no, todo funciona igual pero sin persistencia en Firebase desde el server.
+// ── Firebase Admin ───────────────────────────────────────────────
 let db = null;
 try {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  const raw = (process.env.FIREBASE_SERVICE_ACCOUNT || '').trim();
+  if (raw) {
     const admin = require('firebase-admin');
-    const raw = process.env.FIREBASE_SERVICE_ACCOUNT.replace(/\n/g, '\\n');
-const serviceAccount = JSON.parse(raw);
-    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    if (!admin.apps.length) {
+      const serviceAccount = JSON.parse(raw);
+      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    }
     db = admin.firestore();
     console.log('✅ Firebase Admin conectado');
 
-    // Cargar config guardada al iniciar
     db.collection('config').doc('bot').get().then(doc => {
       if (doc.exists) {
         const data = doc.data();
@@ -51,14 +50,16 @@ const serviceAccount = JSON.parse(raw);
         if (data.horario) horario = data.horario;
         console.log('📥 Config restaurada desde Firebase');
         console.log('   serviceNumber:', serviceNumber);
-        console.log('   horario:', horario);
+        console.log('   horario:', JSON.stringify(horario));
+      } else {
+        console.log('📭 No hay config guardada aún en Firebase');
       }
-    }).catch(e => console.error('Error cargando config:', e.message));
+    }).catch(e => console.error('❌ Error cargando config:', e.message));
+  } else {
+    console.log('⚠️ FIREBASE_SERVICE_ACCOUNT no definida');
   }
 } catch(e) {
-  console.log('ℹ️ Firebase Admin no configurado, funcionando sin persistencia de servidor');
-  console.log('❌ Error Firebase:', e.message);
-  console.log('🔍 Primeros 100 chars de la variable:', process.env.FIREBASE_SERVICE_ACCOUNT ? process.env.FIREBASE_SERVICE_ACCOUNT.substring(0,100) : 'VACÍA');
+  console.error('❌ Error iniciando Firebase Admin:', e.message);
 }
 
 async function saveConfigToFirebase() {
@@ -72,7 +73,7 @@ async function saveConfigToFirebase() {
     });
     console.log('💾 Config guardada en Firebase');
   } catch(e) {
-    console.error('Error guardando config:', e.message);
+    console.error('❌ Error guardando config:', e.message);
   }
 }
 
@@ -82,7 +83,7 @@ async function saveVentaToFirebase(factura) {
     await db.collection('ventas').add({ ...factura, createdAt: new Date().toISOString() });
     console.log('💾 Venta guardada en Firebase');
   } catch(e) {
-    console.error('Error guardando venta:', e.message);
+    console.error('❌ Error guardando venta:', e.message);
   }
 }
 
@@ -101,10 +102,7 @@ function killChrome() {
 
 // ── Crear cliente WhatsApp ───────────────────────────────────────
 function createClient() {
-  if (isCreatingClient) {
-    console.log('⚠️ Ya se está creando un cliente, ignorando...');
-    return;
-  }
+  if (isCreatingClient) { console.log('⚠️ Ya se está creando un cliente, ignorando...'); return; }
   isCreatingClient = true;
   console.log('🚀 Creando cliente WhatsApp...');
   killChrome();
@@ -170,7 +168,6 @@ function createClient() {
       if (msg.fromMe) { console.log('⏭️ Mensaje propio, ignorando'); return; }
       if (!botActive) { console.log('⏸️ Bot pausado'); return; }
 
-      // ── Verificar horario ──────────────────────────────────────
       if (horario) {
         const now = new Date(new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }));
         const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
@@ -180,10 +177,8 @@ function createClient() {
         const [hf, mf] = horario.fin.split(':').map(Number);
         const inicio = hi * 60 + mi;
         const fin = hf * 60 + mf;
-
         console.log(`🕐 Día: ${diaActual} | Hora: ${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')} | Rango: ${horario.inicio}-${horario.fin}`);
         console.log(`   Días activos: ${horario.dias.join(',')}`);
-
         if (!horario.dias.includes(diaActual) || horaActual < inicio || horaActual > fin) {
           console.log('🕐 Fuera de horario');
           await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
@@ -216,25 +211,18 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
           ...conversaciones[from].slice(-12)
         ];
 
-        const result = await groq.chat.completions.create({
-          model: 'llama-3.3-70b-versatile',
-          messages
-        });
-
+        const result = await groq.chat.completions.create({ model: 'llama-3.3-70b-versatile', messages });
         let reply = result.choices[0].message.content;
         console.log('✅ Groq respondió, longitud:', reply.length);
 
         conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
         io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: new Date().toLocaleTimeString('es-CO') });
 
-        // ── Procesar factura ─────────────────────────────────────
         if (reply.includes('FACTURA:')) {
           console.log('🧾 Factura detectada');
           const jsonStr = reply.split('FACTURA:')[1].trim();
           try {
             const factura = JSON.parse(jsonStr);
-
-            // Enviar al número de servicio
             console.log('📤 Número de servicio configurado:', serviceNumber);
             if (serviceNumber && clientWA) {
               const numLimpio = serviceNumber.replace(/\D/g, '');
@@ -245,15 +233,11 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
             } else {
               console.log('⚠️ No se envió factura - serviceNumber:', serviceNumber, '| clientWA:', !!clientWA);
             }
-
-            // Guardar en Firebase
             await saveVentaToFirebase(factura);
             io.emit('nuevaVenta', factura);
-
             reply = '✅ *COMPRA CONFIRMADA* 🛒\n⚡ Activación en proceso\n\n✔ Tu acceso será entregado en breve\n✔ Revisa tu correo para recibir los datos\n\n🚨 IMPORTANTE:\n❌ No se hacen cancelaciones después de activar\n\n¡Gracias por confiar en nosotros! 🙌';
           } catch(e) {
             console.error('❌ Error parseando factura:', e.message);
-            console.error('   JSON intentado:', reply.split('FACTURA:')[1]);
           }
         }
 
@@ -263,7 +247,6 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
       } catch (err) {
         console.error('❌ Error Groq:', err.message);
       }
-
       console.log('────────────────────────────────────────');
     });
 
@@ -281,19 +264,14 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
 app.post('/api/configure', async (req, res) => {
   const { instructions, serviceNumber: sn, horario: h } = req.body;
   if (!instructions) return res.status(400).json({ error: 'Instrucciones requeridas' });
-
   botInstructions = instructions;
   if (sn !== undefined) serviceNumber = sn || null;
   if (h !== undefined) horario = h || null;
   botActive = true;
-
   console.log('⚙️ Configuración actualizada');
   console.log('   serviceNumber:', serviceNumber);
-  console.log('   horario:', horario);
-
-  // Guardar en Firebase
+  console.log('   horario:', JSON.stringify(horario));
   await saveConfigToFirebase();
-
   if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
@@ -307,7 +285,6 @@ app.get('/api/status', (req, res) => {
 });
 
 app.get('/api/config', (req, res) => {
-  // El frontend puede pedir la config guardada al cargar
   res.json({
     instructions: botInstructions,
     serviceNumber: serviceNumber || '',
@@ -335,7 +312,7 @@ app.post('/api/stop', (req, res) => {
 
 app.post('/api/horario', async (req, res) => {
   horario = req.body;
-  console.log('🕐 Horario actualizado:', horario);
+  console.log('🕐 Horario actualizado:', JSON.stringify(horario));
   await saveConfigToFirebase();
   res.json({ ok: true });
 });
@@ -348,7 +325,6 @@ io.on('connection', (socket) => {
   console.log('🖥️ Cliente conectado al socket');
   if (lastQR) socket.emit('update', { qr: lastQR, state: currentState });
   if (currentState === 'ready') socket.emit('update', { state: 'ready', info: lastInfo });
-  // Enviar config actual al panel
   socket.emit('configData', {
     instructions: botInstructions,
     serviceNumber: serviceNumber || '',
