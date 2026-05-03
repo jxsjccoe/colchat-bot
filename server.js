@@ -37,7 +37,7 @@ function killChrome() {
     const lockFile = '/app/.wwebjs_auth/session/SingletonLock';
     if (fs.existsSync(lockFile)) {
       fs.unlinkSync(lockFile);
-      console.log('Lock file eliminado');
+      console.log('🔓 Lock file eliminado');
     }
   } catch(e) {}
   try {
@@ -49,8 +49,12 @@ function killChrome() {
 }
 
 function createClient() {
-  if (isCreatingClient) return;
+  if (isCreatingClient) {
+    console.log('⚠️ Ya se está creando un cliente, ignorando...');
+    return;
+  }
   isCreatingClient = true;
+  console.log('🚀 Creando cliente WhatsApp...');
 
   killChrome();
 
@@ -77,7 +81,7 @@ function createClient() {
     });
 
     clientWA.on('qr', async (qr) => {
-      console.log('QR generado');
+      console.log('📱 QR generado - escanea con WhatsApp');
       lastQR = await qrcode.toDataURL(qr);
       currentState = 'qr';
       isCreatingClient = false;
@@ -85,7 +89,7 @@ function createClient() {
     });
 
     clientWA.on('ready', () => {
-      console.log('WhatsApp conectado');
+      console.log('✅ WhatsApp conectado y listo para recibir mensajes');
       currentState = 'ready';
       lastInfo = clientWA.info;
       lastQR = null;
@@ -94,24 +98,49 @@ function createClient() {
     });
 
     clientWA.on('authenticated', () => {
-      console.log('Autenticado');
+      console.log('🔐 Autenticado correctamente');
       currentState = 'connecting';
       io.emit('update', { state: 'connecting' });
     });
 
+    clientWA.on('auth_failure', (msg) => {
+      console.error('❌ Fallo de autenticación:', msg);
+      currentState = 'disconnected';
+      isCreatingClient = false;
+    });
+
     clientWA.on('disconnected', (reason) => {
-      console.log('Desconectado:', reason);
+      console.log('🔌 Desconectado. Razón:', reason);
       currentState = 'disconnected';
       lastQR = null;
       isCreatingClient = false;
       io.emit('update', { state: 'disconnected' });
+      console.log('⏳ Reconectando en 5 segundos...');
       setTimeout(createClient, 5000);
     });
 
     clientWA.on('message', async (msg) => {
-      if (msg.fromMe) return;
-      if (!botActive) return;
+      // ── LOGS DE DIAGNÓSTICO ──────────────────────────────────────
+      console.log('────────────────────────────────────────');
+      console.log('📨 Mensaje recibido');
+      console.log('   De:', msg.from);
+      console.log('   Texto:', msg.body);
+      console.log('   fromMe:', msg.fromMe);
+      console.log('   botActive:', botActive);
+      console.log('   Estado bot:', currentState);
+      // ────────────────────────────────────────────────────────────
 
+      if (msg.fromMe) {
+        console.log('⏭️ Ignorando mensaje propio');
+        return;
+      }
+
+      if (!botActive) {
+        console.log('⏸️ Bot pausado, no se responde');
+        return;
+      }
+
+      // Verificar horario
       if (horario) {
         const now = new Date();
         const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
@@ -122,7 +151,10 @@ function createClient() {
         const inicio = hi * 60 + mi;
         const fin = hf * 60 + mf;
 
+        console.log('🕐 Verificando horario - Día:', diaActual, '| Hora actual (min):', horaActual, '| Rango:', inicio, '-', fin);
+
         if (!horario.dias.includes(diaActual) || horaActual < inicio || horaActual > fin) {
+          console.log('🕐 Fuera de horario, enviando mensaje de horario');
           await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
           return;
         }
@@ -135,6 +167,8 @@ function createClient() {
       conversaciones[from].push({ role: 'user', content: body, time: new Date().toLocaleTimeString('es-CO') });
 
       io.emit('nuevoMensaje', { from, text: body, role: 'user', time: new Date().toLocaleTimeString('es-CO') });
+
+      console.log('🤖 Enviando a Groq...');
 
       try {
         const systemPrompt = `${botInstructions}
@@ -156,11 +190,13 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
         });
 
         let reply = result.choices[0].message.content;
-        conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
+        console.log('✅ Respuesta de Groq obtenida, longitud:', reply.length);
 
+        conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
         io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: new Date().toLocaleTimeString('es-CO') });
 
         if (reply.includes('FACTURA:')) {
+          console.log('🧾 Factura detectada, procesando...');
           const jsonStr = reply.split('FACTURA:')[1].trim();
           try {
             const factura = JSON.parse(jsonStr);
@@ -169,27 +205,31 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
             if (serviceNumber && clientWA) {
               const numLimpio = serviceNumber.replace(/\D/g, '');
               await clientWA.sendMessage(numLimpio + '@c.us', mensajeFactura);
-              console.log('Factura enviada a:', serviceNumber);
+              console.log('📤 Factura enviada a:', serviceNumber);
             }
 
             io.emit('nuevaVenta', factura);
             reply = '✅ *COMPRA CONFIRMADA* 🛒\n⚡ Activación en proceso\n\n✔ Tu acceso será entregado en breve\n✔ Revisa tu correo para recibir los datos\n\n🚨 IMPORTANTE:\n❌ No se hacen cancelaciones después de activar\n\n¡Gracias por confiar en STREAMSHOP! 🙌';
           } catch(e) {
-            console.error('Error parseando factura:', e.message);
+            console.error('❌ Error parseando factura:', e.message);
           }
         }
 
         await msg.reply(reply);
-        console.log('Respondido a:', from);
+        console.log('📤 Respuesta enviada a:', from);
 
       } catch (err) {
-        console.error('Error Groq:', err.message);
+        console.error('❌ Error Groq:', err.message);
+        console.error('   Stack:', err.stack);
       }
+
+      console.log('────────────────────────────────────────');
     });
 
     clientWA.initialize().catch(err => {
-      console.error('Error inicializando cliente:', err.message);
+      console.error('❌ Error inicializando cliente:', err.message);
       isCreatingClient = false;
+      console.log('⏳ Reintentando en 8 segundos...');
       setTimeout(createClient, 8000);
     });
 
@@ -203,7 +243,7 @@ app.post('/api/configure', (req, res) => {
   if (sn) serviceNumber = sn;
   if (h) horario = h;
   botActive = true;
-  console.log('Configuracion actualizada');
+  console.log('⚙️ Configuracion actualizada');
   if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
@@ -217,6 +257,7 @@ app.get('/api/status', (req, res) => {
 });
 
 app.post('/api/restart', (req, res) => {
+  console.log('🔄 Reiniciando cliente...');
   if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
@@ -228,14 +269,14 @@ app.post('/api/restart', (req, res) => {
 
 app.post('/api/stop', (req, res) => {
   botActive = false;
-  console.log('Bot detenido');
+  console.log('⏸️ Bot detenido manualmente');
   io.emit('update', { botStopped: true });
   res.json({ ok: true });
 });
 
 app.post('/api/horario', (req, res) => {
   horario = req.body;
-  console.log('Horario actualizado:', horario);
+  console.log('🕐 Horario actualizado:', horario);
   res.json({ ok: true });
 });
 
@@ -244,13 +285,13 @@ app.get('/', (req, res) => {
 });
 
 io.on('connection', (socket) => {
-  console.log('Cliente conectado al socket');
+  console.log('🖥️ Cliente conectado al socket');
   if (lastQR) socket.emit('update', { qr: lastQR, state: currentState });
   if (currentState === 'ready') socket.emit('update', { state: 'ready', info: lastInfo });
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log('Chatly Colombia activo en puerto ' + PORT);
+  console.log('🟢 Chatly Colombia activo en puerto ' + PORT);
   createClient();
 });
