@@ -5,6 +5,9 @@ const Groq = require('groq-sdk');
 const qrcode = require('qrcode');
 const http = require('http');
 const cors = require('cors');
+const { execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,139 +20,195 @@ const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
 let botInstructions = 'Eres un asistente de servicio al cliente amable y profesional.';
 let serviceNumber = null;
+let horario = null;
 let clientWA = null;
 let currentState = 'disconnected';
 let lastQR = null;
 let lastInfo = null;
 let botActive = true;
+let isCreatingClient = false;
 
 const conversaciones = {};
 
+function killChrome() {
+  try { execSync('pkill -f chromium || true', { stdio: 'ignore' }); } catch(e) {}
+  try { execSync('pkill -f chrome || true', { stdio: 'ignore' }); } catch(e) {}
+  try {
+    const lockFile = '/app/.wwebjs_auth/session/SingletonLock';
+    if (fs.existsSync(lockFile)) {
+      fs.unlinkSync(lockFile);
+      console.log('Lock file eliminado');
+    }
+  } catch(e) {}
+  try {
+    const cacheDir = '/app/.wwebjs_cache';
+    if (fs.existsSync(cacheDir)) {
+      execSync('rm -rf ' + cacheDir + '/SingletonLock || true', { stdio: 'ignore' });
+    }
+  } catch(e) {}
+}
+
 function createClient() {
-  clientWA = new Client({
-    authStrategy: new LocalAuth(),
-    puppeteer: {
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-accelerated-2d-canvas','--no-first-run','--no-zygote','--single-process','--disable-gpu']
-    }
-  });
+  if (isCreatingClient) return;
+  isCreatingClient = true;
 
-  clientWA.on('qr', async (qr) => {
-    console.log('QR generado');
-    lastQR = await qrcode.toDataURL(qr);
-    currentState = 'qr';
-    io.emit('update', { qr: lastQR, state: 'qr' });
-  });
+  killChrome();
 
-  clientWA.on('ready', () => {
-    console.log('WhatsApp conectado');
-    currentState = 'ready';
-    lastInfo = clientWA.info;
-    lastQR = null;
-    io.emit('update', { state: 'ready', info: lastInfo });
-  });
+  setTimeout(() => {
+    clientWA = new Client({
+      authStrategy: new LocalAuth(),
+      puppeteer: {
+        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+        args: [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas',
+          '--no-first-run',
+          '--no-zygote',
+          '--single-process',
+          '--disable-gpu',
+          '--disable-extensions',
+          '--disable-background-networking',
+          '--disable-default-apps',
+          '--no-default-browser-check',
+        ]
+      }
+    });
 
-  clientWA.on('authenticated', () => {
-    console.log('Autenticado');
-    currentState = 'connecting';
-    io.emit('update', { state: 'connecting' });
-  });
+    clientWA.on('qr', async (qr) => {
+      console.log('QR generado');
+      lastQR = await qrcode.toDataURL(qr);
+      currentState = 'qr';
+      isCreatingClient = false;
+      io.emit('update', { qr: lastQR, state: 'qr' });
+    });
 
-  clientWA.on('disconnected', (reason) => {
-    console.log('Desconectado:', reason);
-    currentState = 'disconnected';
-    lastQR = null;
-    io.emit('update', { state: 'disconnected' });
-    setTimeout(createClient, 3000);
-  });
+    clientWA.on('ready', () => {
+      console.log('WhatsApp conectado');
+      currentState = 'ready';
+      lastInfo = clientWA.info;
+      lastQR = null;
+      isCreatingClient = false;
+      io.emit('update', { state: 'ready', info: lastInfo });
+    });
 
-  clientWA.on('message', async (msg) => {
-    if (msg.fromMe) return;
-    if (!botActive) return;
+    clientWA.on('authenticated', () => {
+      console.log('Autenticado');
+      currentState = 'connecting';
+      io.emit('update', { state: 'connecting' });
+    });
 
-    const from = msg.from;
-    const body = msg.body.trim();
+    clientWA.on('disconnected', (reason) => {
+      console.log('Desconectado:', reason);
+      currentState = 'disconnected';
+      lastQR = null;
+      isCreatingClient = false;
+      io.emit('update', { state: 'disconnected' });
+      setTimeout(createClient, 5000);
+    });
 
-    if (!conversaciones[from]) {
-      conversaciones[from] = { historial: [], fase: 'chat' };
-    }
+    clientWA.on('message', async (msg) => {
+      if (msg.fromMe) return;
+      if (!botActive) return;
 
-    const conv = conversaciones[from];
-    conv.historial.push({ role: 'user', content: body });
+      if (horario) {
+        const now = new Date();
+        const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
+        const diaActual = diasMap[now.getDay()];
+        const horaActual = now.getHours() * 60 + now.getMinutes();
+        const [hi, mi] = horario.inicio.split(':').map(Number);
+        const [hf, mf] = horario.fin.split(':').map(Number);
+        const inicio = hi * 60 + mi;
+        const fin = hf * 60 + mf;
 
-    try {
-      const systemPrompt = `${botInstructions}
-
-REGLAS IMPORTANTES:
-1. Cuando el cliente quiera comprar algo, debes recopilar esta informacion en orden:
-   - Nombre completo
-   - Numero de telefono
-   - Correo electronico
-   - Producto o servicio que desea comprar
-   - Confirmar el precio final
-2. Una vez tengas todos esos datos, pregunta: "Para confirmar tu pedido, responde SI"
-3. Cuando el cliente responda "SI" para confirmar, responde EXACTAMENTE con este formato JSON y nada mas:
-FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio":"...","fecha":"${new Date().toLocaleDateString('es-CO')}"}
-4. Si el cliente no quiere comprar, atiendelo normalmente segun tus instrucciones.`;
-
-      const messages = [
-        { role: 'system', content: systemPrompt },
-        ...conv.historial.slice(-10)
-      ];
-
-      const result = await groq.chat.completions.create({
-        model: 'llama-3.3-70b-versatile',
-        messages
-      });
-
-      let reply = result.choices[0].message.content;
-      conv.historial.push({ role: 'assistant', content: reply });
-
-      if (reply.includes('FACTURA:')) {
-        const jsonStr = reply.split('FACTURA:')[1].trim();
-        try {
-          const factura = JSON.parse(jsonStr);
-          const mensajeFactura = `🧾 *NUEVA VENTA*\n\n*Nombre:* ${factura.nombre}\n*Teléfono:* ${factura.telefono}\n*Correo:* ${factura.correo}\n*Producto:* ${factura.producto}\n*Precio:* ${factura.precio}\n*Fecha:* ${factura.fecha}`;
-
-          if (serviceNumber && clientWA) {
-            const numLimpio = serviceNumber.replace(/\D/g, '');
-            await clientWA.sendMessage(numLimpio + '@c.us', mensajeFactura);
-            console.log('Factura enviada a:', serviceNumber);
-          }
-
-          io.emit('nuevaVenta', factura);
-          reply = 'Tu pedido ha sido confirmado. Pronto nos pondremos en contacto contigo. Gracias por tu compra.';
-          conv.fase = 'completado';
-        } catch (e) {
-          console.error('Error parseando factura:', e.message);
+        if (!horario.dias.includes(diaActual) || horaActual < inicio || horaActual > fin) {
+          await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
+          return;
         }
       }
 
-      await msg.reply(reply);
-      console.log('Respondido a:', from);
+      const from = msg.from;
+      const body = msg.body.trim();
 
-    } catch (err) {
-      console.error('Error Groq:', err.message);
-    }
-  });
+      if (!conversaciones[from]) conversaciones[from] = [];
+      conversaciones[from].push({ role: 'user', content: body, time: new Date().toLocaleTimeString('es-CO') });
 
-  clientWA.initialize().catch(err => {
-    console.error('Error inicializando cliente:', err.message);
-    setTimeout(createClient, 5000);
-  });
+      io.emit('nuevoMensaje', { from, text: body, role: 'user', time: new Date().toLocaleTimeString('es-CO') });
+
+      try {
+        const systemPrompt = `${botInstructions}
+
+REGLAS DE COMPRA:
+1. Cuando el cliente quiera comprar, solicita: Nombre completo, número de teléfono y correo electrónico.
+2. Una vez tengas los 3 datos, pregunta: "Para confirmar tu pedido, responde SI"
+3. Cuando el cliente responda "SI", responde EXACTAMENTE con este formato y nada más:
+FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio":"...","fecha":"${new Date().toLocaleDateString('es-CO')}"}`;
+
+        const messages = [
+          { role: 'system', content: systemPrompt },
+          ...conversaciones[from].slice(-12)
+        ];
+
+        const result = await groq.chat.completions.create({
+          model: 'llama-3.3-70b-versatile',
+          messages
+        });
+
+        let reply = result.choices[0].message.content;
+        conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
+
+        io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: new Date().toLocaleTimeString('es-CO') });
+
+        if (reply.includes('FACTURA:')) {
+          const jsonStr = reply.split('FACTURA:')[1].trim();
+          try {
+            const factura = JSON.parse(jsonStr);
+            const mensajeFactura = `🧾 *NUEVA VENTA - STREAMSHOP*\n\n*Nombre:* ${factura.nombre}\n*Teléfono:* ${factura.telefono}\n*Correo:* ${factura.correo}\n*Producto:* ${factura.producto}\n*Precio:* ${factura.precio}\n*Fecha:* ${factura.fecha}`;
+
+            if (serviceNumber && clientWA) {
+              const numLimpio = serviceNumber.replace(/\D/g, '');
+              await clientWA.sendMessage(numLimpio + '@c.us', mensajeFactura);
+              console.log('Factura enviada a:', serviceNumber);
+            }
+
+            io.emit('nuevaVenta', factura);
+            reply = '✅ *COMPRA CONFIRMADA* 🛒\n⚡ Activación en proceso\n\n✔ Tu acceso será entregado en breve\n✔ Revisa tu correo para recibir los datos\n\n🚨 IMPORTANTE:\n❌ No se hacen cancelaciones después de activar\n\n¡Gracias por confiar en STREAMSHOP! 🙌';
+          } catch(e) {
+            console.error('Error parseando factura:', e.message);
+          }
+        }
+
+        await msg.reply(reply);
+        console.log('Respondido a:', from);
+
+      } catch (err) {
+        console.error('Error Groq:', err.message);
+      }
+    });
+
+    clientWA.initialize().catch(err => {
+      console.error('Error inicializando cliente:', err.message);
+      isCreatingClient = false;
+      setTimeout(createClient, 8000);
+    });
+
+  }, 2000);
 }
 
 app.post('/api/configure', (req, res) => {
-  const { instructions, serviceNumber: sn } = req.body;
+  const { instructions, serviceNumber: sn, horario: h } = req.body;
   if (!instructions) return res.status(400).json({ error: 'Instrucciones requeridas' });
   botInstructions = instructions;
   if (sn) serviceNumber = sn;
+  if (h) horario = h;
   botActive = true;
-  console.log('Instrucciones actualizadas. Numero servicio:', serviceNumber);
+  console.log('Configuracion actualizada');
   if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
-  setTimeout(createClient, 1000);
+  isCreatingClient = false;
+  setTimeout(createClient, 2000);
   res.json({ ok: true });
 });
 
@@ -161,8 +220,9 @@ app.post('/api/restart', (req, res) => {
   if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
+  isCreatingClient = false;
   botActive = true;
-  setTimeout(createClient, 1000);
+  setTimeout(createClient, 2000);
   res.json({ ok: true });
 });
 
@@ -173,8 +233,14 @@ app.post('/api/stop', (req, res) => {
   res.json({ ok: true });
 });
 
+app.post('/api/horario', (req, res) => {
+  horario = req.body;
+  console.log('Horario actualizado:', horario);
+  res.json({ ok: true });
+});
+
 app.get('/', (req, res) => {
-  res.json({ status: 'ColChat corriendo', state: currentState });
+  res.json({ status: 'Chatly Colombia corriendo', state: currentState });
 });
 
 io.on('connection', (socket) => {
@@ -185,6 +251,6 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log('Servidor activo en puerto ' + PORT);
+  console.log('Chatly Colombia activo en puerto ' + PORT);
   createClient();
 });
