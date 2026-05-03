@@ -7,6 +7,7 @@ const http = require('http');
 const cors = require('cors');
 const { execSync } = require('child_process');
 const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -27,6 +28,7 @@ let lastQR = null;
 let lastInfo = null;
 let botActive = true;
 let isCreatingClient = false;
+let reconnectTimer = null;
 const conversaciones = {};
 
 // ── Firebase Admin ───────────────────────────────────────────────
@@ -58,7 +60,7 @@ try {
   } else {
     console.log('⚠️ FIREBASE_SERVICE_ACCOUNT no definida');
   }
-} catch(e) {
+} catch (e) {
   console.error('❌ Error iniciando Firebase Admin:', e.message);
 }
 
@@ -72,7 +74,7 @@ async function saveConfigToFirebase() {
       updatedAt: new Date().toISOString()
     });
     console.log('💾 Config guardada en Firebase');
-  } catch(e) {
+  } catch (e) {
     console.error('❌ Error guardando config:', e.message);
   }
 }
@@ -82,123 +84,212 @@ async function saveVentaToFirebase(factura) {
   try {
     await db.collection('ventas').add({ ...factura, createdAt: new Date().toISOString() });
     console.log('💾 Venta guardada en Firebase');
-  } catch(e) {
+  } catch (e) {
     console.error('❌ Error guardando venta:', e.message);
   }
 }
 
 // ── Chrome cleanup ───────────────────────────────────────────────
 function killChrome() {
-  try { execSync('pkill -f chromium || true', { stdio: 'ignore' }); } catch(e) {}
-  try { execSync('pkill -f chrome || true', { stdio: 'ignore' }); } catch(e) {}
+  try { execSync('pkill -f chromium || true', { stdio: 'ignore' }); } catch (e) {}
+  try { execSync('pkill -f chrome || true', { stdio: 'ignore' }); } catch (e) {}
+  try { execSync('pkill -f "Google Chrome" || true', { stdio: 'ignore' }); } catch (e) {}
+
+  // Eliminar lock files que impiden el arranque
+  const lockPaths = [
+    '/app/.wwebjs_auth/session/SingletonLock',
+    '/app/.wwebjs_auth/session/SingletonSocket',
+    '/app/.wwebjs_auth/session/SingletonCookiesLock',
+    '/app/.wwebjs_cache/SingletonLock',
+  ];
+  for (const p of lockPaths) {
+    try {
+      if (fs.existsSync(p)) {
+        fs.unlinkSync(p);
+        console.log('🔓 Lock eliminado:', p);
+      }
+    } catch (e) {}
+  }
+
+  // Eliminar DevToolsActivePort que causa "Target closed"
   try {
-    const lockFile = '/app/.wwebjs_auth/session/SingletonLock';
-    if (fs.existsSync(lockFile)) { fs.unlinkSync(lockFile); console.log('🔓 Lock file eliminado'); }
-  } catch(e) {}
-  try {
-    execSync('rm -rf /app/.wwebjs_cache/SingletonLock || true', { stdio: 'ignore' });
-  } catch(e) {}
+    const devToolsPort = '/app/.wwebjs_auth/session/DevToolsActivePort';
+    if (fs.existsSync(devToolsPort)) fs.unlinkSync(devToolsPort);
+  } catch (e) {}
+}
+
+// ── Obtener path de Chromium ────────────────────────────────────
+function getChromiumPath() {
+  // 1. Variable de entorno explícita
+  if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+    console.log('🔍 Usando PUPPETEER_EXECUTABLE_PATH:', process.env.PUPPETEER_EXECUTABLE_PATH);
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+
+  // 2. Rutas comunes en Linux/Railway
+  const candidates = [
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/google-chrome',
+    '/snap/bin/chromium',
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) {
+      console.log('🔍 Chromium encontrado en:', p);
+      return p;
+    }
+  }
+
+  // 3. Dejar que puppeteer use el bundled Chromium
+  console.log('🔍 Usando Chromium bundled de puppeteer');
+  return undefined;
+}
+
+// ── Programar reconexión (evita timers duplicados) ───────────────
+function scheduleReconnect(delayMs = 8000) {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  console.log(`⏳ Reconectando en ${delayMs / 1000}s...`);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    createClient();
+  }, delayMs);
 }
 
 // ── Crear cliente WhatsApp ───────────────────────────────────────
 function createClient() {
-  if (isCreatingClient) { console.log('⚠️ Ya se está creando un cliente, ignorando...'); return; }
+  if (isCreatingClient) {
+    console.log('⚠️ Ya se está creando un cliente, ignorando...');
+    return;
+  }
+
   isCreatingClient = true;
   console.log('🚀 Creando cliente WhatsApp...');
   killChrome();
 
+  // Pequeña pausa para que el SO libere recursos del proceso anterior
   setTimeout(() => {
-    clientWA = new Client({
-      authStrategy: new LocalAuth(),
-      puppeteer: {
-        executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-        args: [
-          '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
-          '--single-process', '--disable-gpu', '--disable-extensions',
-          '--disable-background-networking', '--disable-default-apps',
-          '--no-default-browser-check',
-        ]
-      }
-    });
+    try {
+      const executablePath = getChromiumPath();
 
-    clientWA.on('qr', async (qr) => {
-      console.log('📱 QR generado');
-      lastQR = await qrcode.toDataURL(qr);
-      currentState = 'qr';
-      isCreatingClient = false;
-      io.emit('update', { qr: lastQR, state: 'qr' });
-    });
-
-    clientWA.on('ready', () => {
-      console.log('✅ WhatsApp conectado y listo');
-      currentState = 'ready';
-      lastInfo = clientWA.info;
-      lastQR = null;
-      isCreatingClient = false;
-      io.emit('update', { state: 'ready', info: lastInfo });
-    });
-
-    clientWA.on('authenticated', () => {
-      console.log('🔐 Autenticado');
-      currentState = 'connecting';
-      io.emit('update', { state: 'connecting' });
-    });
-
-    clientWA.on('auth_failure', (msg) => {
-      console.error('❌ Fallo de autenticación:', msg);
-      currentState = 'disconnected';
-      isCreatingClient = false;
-    });
-
-    clientWA.on('disconnected', (reason) => {
-      console.log('🔌 Desconectado. Razón:', reason);
-      currentState = 'disconnected';
-      lastQR = null;
-      isCreatingClient = false;
-      io.emit('update', { state: 'disconnected' });
-      console.log('⏳ Reconectando en 5 segundos...');
-      setTimeout(createClient, 5000);
-    });
-
-    clientWA.on('message', async (msg) => {
-      console.log('────────────────────────────────────────');
-      console.log('📨 Mensaje de:', msg.from, '| fromMe:', msg.fromMe, '| botActive:', botActive);
-
-      if (msg.fromMe) { console.log('⏭️ Mensaje propio, ignorando'); return; }
-      if (!botActive) { console.log('⏸️ Bot pausado'); return; }
-
-      if (horario) {
-        const now = new Date(new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }));
-        const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
-        const diaActual = diasMap[now.getDay()];
-        const horaActual = now.getHours() * 60 + now.getMinutes();
-        const [hi, mi] = horario.inicio.split(':').map(Number);
-        const [hf, mf] = horario.fin.split(':').map(Number);
-        const inicio = hi * 60 + mi;
-        const fin = hf * 60 + mf;
-        console.log(`🕐 Día: ${diaActual} | Hora: ${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')} | Rango: ${horario.inicio}-${horario.fin}`);
-        console.log(`   Días activos: ${horario.dias.join(',')}`);
-        if (!horario.dias.includes(diaActual) || horaActual < inicio || horaActual > fin) {
-          console.log('🕐 Fuera de horario');
-          await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
-          return;
+      clientWA = new Client({
+        authStrategy: new LocalAuth({
+          dataPath: '/app/.wwebjs_auth'
+        }),
+        puppeteer: {
+          headless: true,
+          ...(executablePath ? { executablePath } : {}),
+          args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--single-process',
+            '--disable-gpu',
+            '--disable-extensions',
+            '--disable-background-networking',
+            '--disable-default-apps',
+            '--no-default-browser-check',
+            '--disable-features=TranslateUI',
+            '--disable-ipc-flooding-protection',
+            '--memory-pressure-off',
+          ],
+          timeout: 60000,
         }
-      }
+      });
 
-      const from = msg.from;
-      const body = msg.body ? msg.body.trim() : '';
-      if (!body) return;
+      // ── Eventos del cliente ──────────────────────────────────
 
-      if (!conversaciones[from]) conversaciones[from] = [];
-      conversaciones[from].push({ role: 'user', content: body, time: new Date().toLocaleTimeString('es-CO') });
-      io.emit('nuevoMensaje', { from, text: body, role: 'user', time: new Date().toLocaleTimeString('es-CO') });
+      clientWA.on('qr', async (qr) => {
+        console.log('📱 QR generado');
+        try {
+          lastQR = await qrcode.toDataURL(qr);
+          currentState = 'qr';
+          isCreatingClient = false;
+          io.emit('update', { qr: lastQR, state: 'qr' });
+        } catch (e) {
+          console.error('❌ Error generando QR data URL:', e.message);
+        }
+      });
 
-      console.log('🤖 Enviando a Groq...');
+      clientWA.on('loading_screen', (percent, message) => {
+        console.log(`⏳ Cargando WhatsApp: ${percent}% - ${message}`);
+      });
 
-      try {
-        const fechaHoy = new Date().toLocaleDateString('es-CO', { timeZone: 'America/Bogota' });
-        const systemPrompt = `${botInstructions}
+      clientWA.on('authenticated', () => {
+        console.log('🔐 Autenticado');
+        currentState = 'connecting';
+        io.emit('update', { state: 'connecting' });
+      });
+
+      clientWA.on('ready', () => {
+        console.log('✅ WhatsApp conectado y listo');
+        currentState = 'ready';
+        lastInfo = clientWA.info;
+        lastQR = null;
+        isCreatingClient = false;
+        io.emit('update', { state: 'ready', info: lastInfo });
+      });
+
+      clientWA.on('auth_failure', (msg) => {
+        console.error('❌ Fallo de autenticación:', msg);
+        currentState = 'disconnected';
+        isCreatingClient = false;
+        lastQR = null;
+        io.emit('update', { state: 'disconnected' });
+        scheduleReconnect(10000);
+      });
+
+      clientWA.on('disconnected', (reason) => {
+        console.log('🔌 Desconectado. Razón:', reason);
+        currentState = 'disconnected';
+        lastQR = null;
+        isCreatingClient = false;
+        io.emit('update', { state: 'disconnected' });
+        scheduleReconnect(5000);
+      });
+
+      // ── Manejo de mensajes ───────────────────────────────────
+      clientWA.on('message', async (msg) => {
+        console.log('────────────────────────────────────────');
+        console.log('📨 Mensaje de:', msg.from, '| fromMe:', msg.fromMe, '| botActive:', botActive);
+
+        if (msg.fromMe) { console.log('⏭️ Mensaje propio, ignorando'); return; }
+        if (!botActive) { console.log('⏸️ Bot pausado'); return; }
+
+        if (horario) {
+          const now = new Date(new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }));
+          const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
+          const diaActual = diasMap[now.getDay()];
+          const horaActual = now.getHours() * 60 + now.getMinutes();
+          const [hi, mi] = horario.inicio.split(':').map(Number);
+          const [hf, mf] = horario.fin.split(':').map(Number);
+          const inicio = hi * 60 + mi;
+          const fin = hf * 60 + mf;
+          console.log(`🕐 Día: ${diaActual} | Hora: ${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')} | Rango: ${horario.inicio}-${horario.fin}`);
+          console.log(`   Días activos: ${horario.dias.join(',')}`);
+          if (!horario.dias.includes(diaActual) || horaActual < inicio || horaActual > fin) {
+            console.log('🕐 Fuera de horario');
+            await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
+            return;
+          }
+        }
+
+        const from = msg.from;
+        const body = msg.body ? msg.body.trim() : '';
+        if (!body) return;
+
+        if (!conversaciones[from]) conversaciones[from] = [];
+        conversaciones[from].push({ role: 'user', content: body, time: new Date().toLocaleTimeString('es-CO') });
+        io.emit('nuevoMensaje', { from, text: body, role: 'user', time: new Date().toLocaleTimeString('es-CO') });
+
+        console.log('🤖 Enviando a Groq...');
+
+        try {
+          const fechaHoy = new Date().toLocaleDateString('es-CO', { timeZone: 'America/Bogota' });
+          const systemPrompt = `${botInstructions}
 
 REGLAS DE COMPRA:
 1. Cuando el cliente quiera comprar, solicita: Nombre completo, número de teléfono y correo electrónico.
@@ -206,57 +297,66 @@ REGLAS DE COMPRA:
 3. Cuando el cliente responda "SI", responde EXACTAMENTE con este formato y nada más:
 FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio":"...","fecha":"${fechaHoy}"}`;
 
-        const messages = [
-          { role: 'system', content: systemPrompt },
-          ...conversaciones[from].slice(-12)
-        ];
+          const messages = [
+            { role: 'system', content: systemPrompt },
+            ...conversaciones[from].slice(-12)
+          ];
 
-        const result = await groq.chat.completions.create({ model: 'llama-3.3-70b-versatile', messages });
-        let reply = result.choices[0].message.content;
-        console.log('✅ Groq respondió, longitud:', reply.length);
+          const result = await groq.chat.completions.create({ model: 'llama-3.3-70b-versatile', messages });
+          let reply = result.choices[0].message.content;
+          console.log('✅ Groq respondió, longitud:', reply.length);
 
-        conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
-        io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: new Date().toLocaleTimeString('es-CO') });
+          conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
+          io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: new Date().toLocaleTimeString('es-CO') });
 
-        if (reply.includes('FACTURA:')) {
-          console.log('🧾 Factura detectada');
-          const jsonStr = reply.split('FACTURA:')[1].trim();
-          try {
-            const factura = JSON.parse(jsonStr);
-            console.log('📤 Número de servicio configurado:', serviceNumber);
-            if (serviceNumber && clientWA) {
-              const numLimpio = serviceNumber.replace(/\D/g, '');
-              const waId = numLimpio + '@c.us';
-              const mensajeFactura = `🧾 *NUEVA VENTA*\n\n*Nombre:* ${factura.nombre}\n*Teléfono:* ${factura.telefono}\n*Correo:* ${factura.correo}\n*Producto:* ${factura.producto}\n*Precio:* ${factura.precio}\n*Fecha:* ${factura.fecha}`;
-              await clientWA.sendMessage(waId, mensajeFactura);
-              console.log('✅ Factura enviada a:', waId);
-            } else {
-              console.log('⚠️ No se envió factura - serviceNumber:', serviceNumber, '| clientWA:', !!clientWA);
+          if (reply.includes('FACTURA:')) {
+            console.log('🧾 Factura detectada');
+            const jsonStr = reply.split('FACTURA:')[1].trim();
+            try {
+              const factura = JSON.parse(jsonStr);
+              console.log('📤 Número de servicio configurado:', serviceNumber);
+              if (serviceNumber && clientWA) {
+                const numLimpio = serviceNumber.replace(/\D/g, '');
+                const waId = numLimpio + '@c.us';
+                const mensajeFactura = `🧾 *NUEVA VENTA*\n\n*Nombre:* ${factura.nombre}\n*Teléfono:* ${factura.telefono}\n*Correo:* ${factura.correo}\n*Producto:* ${factura.producto}\n*Precio:* ${factura.precio}\n*Fecha:* ${factura.fecha}`;
+                await clientWA.sendMessage(waId, mensajeFactura);
+                console.log('✅ Factura enviada a:', waId);
+              } else {
+                console.log('⚠️ No se envió factura - serviceNumber:', serviceNumber, '| clientWA:', !!clientWA);
+              }
+              await saveVentaToFirebase(factura);
+              io.emit('nuevaVenta', factura);
+              reply = '✅ *COMPRA CONFIRMADA* 🛒\n⚡ Activación en proceso\n\n✔ Tu acceso será entregado en breve\n✔ Revisa tu correo para recibir los datos\n\n🚨 IMPORTANTE:\n❌ No se hacen cancelaciones después de activar\n\n¡Gracias por confiar en nosotros! 🙌';
+            } catch (e) {
+              console.error('❌ Error parseando factura:', e.message);
             }
-            await saveVentaToFirebase(factura);
-            io.emit('nuevaVenta', factura);
-            reply = '✅ *COMPRA CONFIRMADA* 🛒\n⚡ Activación en proceso\n\n✔ Tu acceso será entregado en breve\n✔ Revisa tu correo para recibir los datos\n\n🚨 IMPORTANTE:\n❌ No se hacen cancelaciones después de activar\n\n¡Gracias por confiar en nosotros! 🙌';
-          } catch(e) {
-            console.error('❌ Error parseando factura:', e.message);
           }
+
+          await msg.reply(reply);
+          console.log('📤 Respuesta enviada a:', from);
+
+        } catch (err) {
+          console.error('❌ Error Groq:', err.message);
         }
+        console.log('────────────────────────────────────────');
+      });
 
-        await msg.reply(reply);
-        console.log('📤 Respuesta enviada a:', from);
+      // ── Inicializar ──────────────────────────────────────────
+      clientWA.initialize().catch(err => {
+        console.error('❌ Error inicializando cliente:', err.message);
+        isCreatingClient = false;
+        clientWA = null;
+        scheduleReconnect(8000);
+      });
 
-      } catch (err) {
-        console.error('❌ Error Groq:', err.message);
-      }
-      console.log('────────────────────────────────────────');
-    });
-
-    clientWA.initialize().catch(err => {
-      console.error('❌ Error inicializando cliente:', err.message);
+    } catch (err) {
+      console.error('❌ Error creando cliente:', err.message);
       isCreatingClient = false;
-      setTimeout(createClient, 8000);
-    });
+      clientWA = null;
+      scheduleReconnect(8000);
+    }
 
-  }, 2000);
+  }, 3000); // pausa 3s antes de iniciar Chromium
 }
 
 // ── API ──────────────────────────────────────────────────────────
@@ -272,11 +372,14 @@ app.post('/api/configure', async (req, res) => {
   console.log('   serviceNumber:', serviceNumber);
   console.log('   horario:', JSON.stringify(horario));
   await saveConfigToFirebase();
-  if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
+
+  // Destruir cliente actual y reiniciar
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (clientWA) { try { await clientWA.destroy(); } catch (e) {} clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
   isCreatingClient = false;
-  setTimeout(createClient, 2000);
+  scheduleReconnect(2000);
   res.json({ ok: true });
 });
 
@@ -288,18 +391,19 @@ app.get('/api/config', (req, res) => {
   res.json({
     instructions: botInstructions,
     serviceNumber: serviceNumber || '',
-    horario: horario || { dias: ['lun','mar','mie','jue','vie','sab'], inicio: '09:00', fin: '19:00' }
+    horario: horario || { dias: ['lun', 'mar', 'mie', 'jue', 'vie', 'sab'], inicio: '09:00', fin: '19:00' }
   });
 });
 
-app.post('/api/restart', (req, res) => {
+app.post('/api/restart', async (req, res) => {
   console.log('🔄 Reiniciando cliente...');
-  if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (clientWA) { try { await clientWA.destroy(); } catch (e) {} clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
   isCreatingClient = false;
   botActive = true;
-  setTimeout(createClient, 2000);
+  scheduleReconnect(2000);
   res.json({ ok: true });
 });
 
@@ -321,17 +425,25 @@ app.get('/', (req, res) => {
   res.json({ status: 'Chatly Colombia corriendo', state: currentState });
 });
 
+// ── Socket.IO ────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('🖥️ Cliente conectado al socket');
-  if (lastQR) socket.emit('update', { qr: lastQR, state: currentState });
-  if (currentState === 'ready') socket.emit('update', { state: 'ready', info: lastInfo });
+  // Enviar estado actual al cliente recién conectado
+  if (lastQR && currentState === 'qr') {
+    socket.emit('update', { qr: lastQR, state: 'qr' });
+  } else if (currentState === 'ready') {
+    socket.emit('update', { state: 'ready', info: lastInfo });
+  } else {
+    socket.emit('update', { state: currentState });
+  }
   socket.emit('configData', {
     instructions: botInstructions,
     serviceNumber: serviceNumber || '',
-    horario: horario || { dias: ['lun','mar','mie','jue','vie','sab'], inicio: '09:00', fin: '19:00' }
+    horario: horario || { dias: ['lun', 'mar', 'mie', 'jue', 'vie', 'sab'], inicio: '09:00', fin: '19:00' }
   });
 });
 
+// ── Arranque ─────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log('🟢 Chatly Colombia activo en puerto ' + PORT);
