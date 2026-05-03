@@ -7,7 +7,6 @@ const http = require('http');
 const cors = require('cors');
 const { execSync } = require('child_process');
 const fs = require('fs');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -18,6 +17,7 @@ app.use(express.json());
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+// ── Estado en memoria ────────────────────────────────────────────
 let botInstructions = 'Eres un asistente de servicio al cliente amable y profesional.';
 let serviceNumber = null;
 let horario = null;
@@ -27,27 +27,76 @@ let lastQR = null;
 let lastInfo = null;
 let botActive = true;
 let isCreatingClient = false;
-
 const conversaciones = {};
 
+// ── Firebase Admin (opcional) ────────────────────────────────────
+// Si tienes FIREBASE_SERVICE_ACCOUNT en Railway, se usa para guardar config/ventas.
+// Si no, todo funciona igual pero sin persistencia en Firebase desde el server.
+let db = null;
+try {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    const admin = require('firebase-admin');
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+    db = admin.firestore();
+    console.log('✅ Firebase Admin conectado');
+
+    // Cargar config guardada al iniciar
+    db.collection('config').doc('bot').get().then(doc => {
+      if (doc.exists) {
+        const data = doc.data();
+        if (data.instructions) botInstructions = data.instructions;
+        if (data.serviceNumber) serviceNumber = data.serviceNumber;
+        if (data.horario) horario = data.horario;
+        console.log('📥 Config restaurada desde Firebase');
+        console.log('   serviceNumber:', serviceNumber);
+        console.log('   horario:', horario);
+      }
+    }).catch(e => console.error('Error cargando config:', e.message));
+  }
+} catch(e) {
+  console.log('ℹ️ Firebase Admin no configurado, funcionando sin persistencia de servidor');
+}
+
+async function saveConfigToFirebase() {
+  if (!db) return;
+  try {
+    await db.collection('config').doc('bot').set({
+      instructions: botInstructions,
+      serviceNumber: serviceNumber || null,
+      horario: horario || null,
+      updatedAt: new Date().toISOString()
+    });
+    console.log('💾 Config guardada en Firebase');
+  } catch(e) {
+    console.error('Error guardando config:', e.message);
+  }
+}
+
+async function saveVentaToFirebase(factura) {
+  if (!db) return;
+  try {
+    await db.collection('ventas').add({ ...factura, createdAt: new Date().toISOString() });
+    console.log('💾 Venta guardada en Firebase');
+  } catch(e) {
+    console.error('Error guardando venta:', e.message);
+  }
+}
+
+// ── Chrome cleanup ───────────────────────────────────────────────
 function killChrome() {
   try { execSync('pkill -f chromium || true', { stdio: 'ignore' }); } catch(e) {}
   try { execSync('pkill -f chrome || true', { stdio: 'ignore' }); } catch(e) {}
   try {
     const lockFile = '/app/.wwebjs_auth/session/SingletonLock';
-    if (fs.existsSync(lockFile)) {
-      fs.unlinkSync(lockFile);
-      console.log('🔓 Lock file eliminado');
-    }
+    if (fs.existsSync(lockFile)) { fs.unlinkSync(lockFile); console.log('🔓 Lock file eliminado'); }
   } catch(e) {}
   try {
-    const cacheDir = '/app/.wwebjs_cache';
-    if (fs.existsSync(cacheDir)) {
-      execSync('rm -rf ' + cacheDir + '/SingletonLock || true', { stdio: 'ignore' });
-    }
+    execSync('rm -rf /app/.wwebjs_cache/SingletonLock || true', { stdio: 'ignore' });
   } catch(e) {}
 }
 
+// ── Crear cliente WhatsApp ───────────────────────────────────────
 function createClient() {
   if (isCreatingClient) {
     console.log('⚠️ Ya se está creando un cliente, ignorando...');
@@ -55,7 +104,6 @@ function createClient() {
   }
   isCreatingClient = true;
   console.log('🚀 Creando cliente WhatsApp...');
-
   killChrome();
 
   setTimeout(() => {
@@ -64,24 +112,17 @@ function createClient() {
       puppeteer: {
         executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
         args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process',
-          '--disable-gpu',
-          '--disable-extensions',
-          '--disable-background-networking',
-          '--disable-default-apps',
+          '--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage',
+          '--disable-accelerated-2d-canvas', '--no-first-run', '--no-zygote',
+          '--single-process', '--disable-gpu', '--disable-extensions',
+          '--disable-background-networking', '--disable-default-apps',
           '--no-default-browser-check',
         ]
       }
     });
 
     clientWA.on('qr', async (qr) => {
-      console.log('📱 QR generado - escanea con WhatsApp');
+      console.log('📱 QR generado');
       lastQR = await qrcode.toDataURL(qr);
       currentState = 'qr';
       isCreatingClient = false;
@@ -89,7 +130,7 @@ function createClient() {
     });
 
     clientWA.on('ready', () => {
-      console.log('✅ WhatsApp conectado y listo para recibir mensajes');
+      console.log('✅ WhatsApp conectado y listo');
       currentState = 'ready';
       lastInfo = clientWA.info;
       lastQR = null;
@@ -98,7 +139,7 @@ function createClient() {
     });
 
     clientWA.on('authenticated', () => {
-      console.log('🔐 Autenticado correctamente');
+      console.log('🔐 Autenticado');
       currentState = 'connecting';
       io.emit('update', { state: 'connecting' });
     });
@@ -120,29 +161,15 @@ function createClient() {
     });
 
     clientWA.on('message', async (msg) => {
-      // ── LOGS DE DIAGNÓSTICO ──────────────────────────────────────
       console.log('────────────────────────────────────────');
-      console.log('📨 Mensaje recibido');
-      console.log('   De:', msg.from);
-      console.log('   Texto:', msg.body);
-      console.log('   fromMe:', msg.fromMe);
-      console.log('   botActive:', botActive);
-      console.log('   Estado bot:', currentState);
-      // ────────────────────────────────────────────────────────────
+      console.log('📨 Mensaje de:', msg.from, '| fromMe:', msg.fromMe, '| botActive:', botActive);
 
-      if (msg.fromMe) {
-        console.log('⏭️ Ignorando mensaje propio');
-        return;
-      }
+      if (msg.fromMe) { console.log('⏭️ Mensaje propio, ignorando'); return; }
+      if (!botActive) { console.log('⏸️ Bot pausado'); return; }
 
-      if (!botActive) {
-        console.log('⏸️ Bot pausado, no se responde');
-        return;
-      }
-
-      // Verificar horario
+      // ── Verificar horario ──────────────────────────────────────
       if (horario) {
-  const now = new Date(new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }));
+        const now = new Date(new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }));
         const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
         const diaActual = diasMap[now.getDay()];
         const horaActual = now.getHours() * 60 + now.getMinutes();
@@ -151,33 +178,35 @@ function createClient() {
         const inicio = hi * 60 + mi;
         const fin = hf * 60 + mf;
 
-        console.log('🕐 Verificando horario - Día:', diaActual, '| Hora actual (min):', horaActual, '| Rango:', inicio, '-', fin);
+        console.log(`🕐 Día: ${diaActual} | Hora: ${now.getHours()}:${String(now.getMinutes()).padStart(2,'0')} | Rango: ${horario.inicio}-${horario.fin}`);
+        console.log(`   Días activos: ${horario.dias.join(',')}`);
 
         if (!horario.dias.includes(diaActual) || horaActual < inicio || horaActual > fin) {
-          console.log('🕐 Fuera de horario, enviando mensaje de horario');
+          console.log('🕐 Fuera de horario');
           await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
           return;
         }
       }
 
       const from = msg.from;
-      const body = msg.body.trim();
+      const body = msg.body ? msg.body.trim() : '';
+      if (!body) return;
 
       if (!conversaciones[from]) conversaciones[from] = [];
       conversaciones[from].push({ role: 'user', content: body, time: new Date().toLocaleTimeString('es-CO') });
-
       io.emit('nuevoMensaje', { from, text: body, role: 'user', time: new Date().toLocaleTimeString('es-CO') });
 
       console.log('🤖 Enviando a Groq...');
 
       try {
+        const fechaHoy = new Date().toLocaleDateString('es-CO', { timeZone: 'America/Bogota' });
         const systemPrompt = `${botInstructions}
 
 REGLAS DE COMPRA:
 1. Cuando el cliente quiera comprar, solicita: Nombre completo, número de teléfono y correo electrónico.
 2. Una vez tengas los 3 datos, pregunta: "Para confirmar tu pedido, responde SI"
 3. Cuando el cliente responda "SI", responde EXACTAMENTE con este formato y nada más:
-FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio":"...","fecha":"${new Date().toLocaleDateString('es-CO')}"}`;
+FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio":"...","fecha":"${fechaHoy}"}`;
 
         const messages = [
           { role: 'system', content: systemPrompt },
@@ -190,28 +219,38 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
         });
 
         let reply = result.choices[0].message.content;
-        console.log('✅ Respuesta de Groq obtenida, longitud:', reply.length);
+        console.log('✅ Groq respondió, longitud:', reply.length);
 
         conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
         io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: new Date().toLocaleTimeString('es-CO') });
 
+        // ── Procesar factura ─────────────────────────────────────
         if (reply.includes('FACTURA:')) {
-          console.log('🧾 Factura detectada, procesando...');
+          console.log('🧾 Factura detectada');
           const jsonStr = reply.split('FACTURA:')[1].trim();
           try {
             const factura = JSON.parse(jsonStr);
-            const mensajeFactura = `🧾 *NUEVA VENTA - STREAMSHOP*\n\n*Nombre:* ${factura.nombre}\n*Teléfono:* ${factura.telefono}\n*Correo:* ${factura.correo}\n*Producto:* ${factura.producto}\n*Precio:* ${factura.precio}\n*Fecha:* ${factura.fecha}`;
 
+            // Enviar al número de servicio
+            console.log('📤 Número de servicio configurado:', serviceNumber);
             if (serviceNumber && clientWA) {
               const numLimpio = serviceNumber.replace(/\D/g, '');
-              await clientWA.sendMessage(numLimpio + '@c.us', mensajeFactura);
-              console.log('📤 Factura enviada a:', serviceNumber);
+              const waId = numLimpio + '@c.us';
+              const mensajeFactura = `🧾 *NUEVA VENTA*\n\n*Nombre:* ${factura.nombre}\n*Teléfono:* ${factura.telefono}\n*Correo:* ${factura.correo}\n*Producto:* ${factura.producto}\n*Precio:* ${factura.precio}\n*Fecha:* ${factura.fecha}`;
+              await clientWA.sendMessage(waId, mensajeFactura);
+              console.log('✅ Factura enviada a:', waId);
+            } else {
+              console.log('⚠️ No se envió factura - serviceNumber:', serviceNumber, '| clientWA:', !!clientWA);
             }
 
+            // Guardar en Firebase
+            await saveVentaToFirebase(factura);
             io.emit('nuevaVenta', factura);
-            reply = '✅ *COMPRA CONFIRMADA* 🛒\n⚡ Activación en proceso\n\n✔ Tu acceso será entregado en breve\n✔ Revisa tu correo para recibir los datos\n\n🚨 IMPORTANTE:\n❌ No se hacen cancelaciones después de activar\n\n¡Gracias por confiar en STREAMSHOP! 🙌';
+
+            reply = '✅ *COMPRA CONFIRMADA* 🛒\n⚡ Activación en proceso\n\n✔ Tu acceso será entregado en breve\n✔ Revisa tu correo para recibir los datos\n\n🚨 IMPORTANTE:\n❌ No se hacen cancelaciones después de activar\n\n¡Gracias por confiar en nosotros! 🙌';
           } catch(e) {
             console.error('❌ Error parseando factura:', e.message);
+            console.error('   JSON intentado:', reply.split('FACTURA:')[1]);
           }
         }
 
@@ -220,7 +259,6 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
 
       } catch (err) {
         console.error('❌ Error Groq:', err.message);
-        console.error('   Stack:', err.stack);
       }
 
       console.log('────────────────────────────────────────');
@@ -229,21 +267,30 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
     clientWA.initialize().catch(err => {
       console.error('❌ Error inicializando cliente:', err.message);
       isCreatingClient = false;
-      console.log('⏳ Reintentando en 8 segundos...');
       setTimeout(createClient, 8000);
     });
 
   }, 2000);
 }
 
-app.post('/api/configure', (req, res) => {
+// ── API ──────────────────────────────────────────────────────────
+
+app.post('/api/configure', async (req, res) => {
   const { instructions, serviceNumber: sn, horario: h } = req.body;
   if (!instructions) return res.status(400).json({ error: 'Instrucciones requeridas' });
+
   botInstructions = instructions;
-  if (sn) serviceNumber = sn;
-  if (h) horario = h;
+  if (sn !== undefined) serviceNumber = sn || null;
+  if (h !== undefined) horario = h || null;
   botActive = true;
-  console.log('⚙️ Configuracion actualizada');
+
+  console.log('⚙️ Configuración actualizada');
+  console.log('   serviceNumber:', serviceNumber);
+  console.log('   horario:', horario);
+
+  // Guardar en Firebase
+  await saveConfigToFirebase();
+
   if (clientWA) { clientWA.destroy().catch(() => {}); clientWA = null; }
   lastQR = null;
   currentState = 'disconnected';
@@ -254,6 +301,15 @@ app.post('/api/configure', (req, res) => {
 
 app.get('/api/status', (req, res) => {
   res.json({ state: currentState, qr: lastQR, info: lastInfo });
+});
+
+app.get('/api/config', (req, res) => {
+  // El frontend puede pedir la config guardada al cargar
+  res.json({
+    instructions: botInstructions,
+    serviceNumber: serviceNumber || '',
+    horario: horario || { dias: ['lun','mar','mie','jue','vie','sab'], inicio: '09:00', fin: '19:00' }
+  });
 });
 
 app.post('/api/restart', (req, res) => {
@@ -269,14 +325,15 @@ app.post('/api/restart', (req, res) => {
 
 app.post('/api/stop', (req, res) => {
   botActive = false;
-  console.log('⏸️ Bot detenido manualmente');
+  console.log('⏸️ Bot detenido');
   io.emit('update', { botStopped: true });
   res.json({ ok: true });
 });
 
-app.post('/api/horario', (req, res) => {
+app.post('/api/horario', async (req, res) => {
   horario = req.body;
   console.log('🕐 Horario actualizado:', horario);
+  await saveConfigToFirebase();
   res.json({ ok: true });
 });
 
@@ -288,6 +345,12 @@ io.on('connection', (socket) => {
   console.log('🖥️ Cliente conectado al socket');
   if (lastQR) socket.emit('update', { qr: lastQR, state: currentState });
   if (currentState === 'ready') socket.emit('update', { state: 'ready', info: lastInfo });
+  // Enviar config actual al panel
+  socket.emit('configData', {
+    instructions: botInstructions,
+    serviceNumber: serviceNumber || '',
+    horario: horario || { dias: ['lun','mar','mie','jue','vie','sab'], inicio: '09:00', fin: '19:00' }
+  });
 });
 
 const PORT = process.env.PORT || 3000;
