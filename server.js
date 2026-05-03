@@ -36,7 +36,8 @@ let db = null;
 try {
   if (process.env.FIREBASE_SERVICE_ACCOUNT) {
     const admin = require('firebase-admin');
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT.replace(/\n/g, '\\n');
+const serviceAccount = JSON.parse(raw);
     admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     db = admin.firestore();
     console.log('✅ Firebase Admin conectado');
