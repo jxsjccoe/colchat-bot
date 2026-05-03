@@ -57,6 +57,8 @@ const serviceAccount = JSON.parse(raw);
   }
 } catch(e) {
   console.log('ℹ️ Firebase Admin no configurado, funcionando sin persistencia de servidor');
+  console.log('❌ Error Firebase:', e.message);
+  console.log('🔍 Primeros 100 chars de la variable:', process.env.FIREBASE_SERVICE_ACCOUNT ? process.env.FIREBASE_SERVICE_ACCOUNT.substring(0,100) : 'VACÍA');
 }
 
 async function saveConfigToFirebase() {
