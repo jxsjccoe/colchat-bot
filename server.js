@@ -7,7 +7,6 @@ const http = require('http');
 const cors = require('cors');
 const { execSync } = require('child_process');
 const fs = require('fs');
-const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
@@ -30,6 +29,28 @@ let botActive = true;
 let isCreatingClient = false;
 let reconnectTimer = null;
 const conversaciones = {};
+
+// ── Hora Bogotá (UTC-5, sin horario de verano) ───────────────────
+function getNowBogota() {
+  const nowUTC = new Date();
+  return new Date(nowUTC.getTime() + (-5 * 60 * 60000));
+}
+
+function getFechaBogota() {
+  const now = getNowBogota();
+  const d = String(now.getUTCDate()).padStart(2, '0');
+  const m = String(now.getUTCMonth() + 1).padStart(2, '0');
+  const y = now.getUTCFullYear();
+  return `${d}/${m}/${y}`;
+}
+
+function getTimeBogota() {
+  const now = getNowBogota();
+  const h = String(now.getUTCHours()).padStart(2, '0');
+  const m = String(now.getUTCMinutes()).padStart(2, '0');
+  const s = String(now.getUTCSeconds()).padStart(2, '0');
+  return `${h}:${m}:${s}`;
+}
 
 // ── Firebase Admin ───────────────────────────────────────────────
 let db = null;
@@ -95,39 +116,28 @@ function killChrome() {
   try { execSync('pkill -f chrome || true', { stdio: 'ignore' }); } catch (e) {}
   try { execSync('pkill -f "Google Chrome" || true', { stdio: 'ignore' }); } catch (e) {}
 
-  // Eliminar lock files que impiden el arranque
   const lockPaths = [
     '/app/.wwebjs_auth/session/SingletonLock',
     '/app/.wwebjs_auth/session/SingletonSocket',
     '/app/.wwebjs_auth/session/SingletonCookiesLock',
+    '/app/.wwebjs_auth/session/DevToolsActivePort',
     '/app/.wwebjs_cache/SingletonLock',
   ];
   for (const p of lockPaths) {
     try {
-      if (fs.existsSync(p)) {
-        fs.unlinkSync(p);
-        console.log('🔓 Lock eliminado:', p);
-      }
+      if (fs.existsSync(p)) { fs.unlinkSync(p); console.log('🔓 Lock eliminado:', p); }
     } catch (e) {}
   }
-
-  // Eliminar DevToolsActivePort que causa "Target closed"
-  try {
-    const devToolsPort = '/app/.wwebjs_auth/session/DevToolsActivePort';
-    if (fs.existsSync(devToolsPort)) fs.unlinkSync(devToolsPort);
-  } catch (e) {}
 }
 
-// ── Obtener path de Chromium ────────────────────────────────────
+// ── Obtener path de Chromium ─────────────────────────────────────
 function getChromiumPath() {
-  // 1. Variable de entorno explícita
   if (process.env.PUPPETEER_EXECUTABLE_PATH) {
     console.log('🔍 Usando PUPPETEER_EXECUTABLE_PATH:', process.env.PUPPETEER_EXECUTABLE_PATH);
     return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-
-  // 2. Rutas comunes en Linux/Railway
   const candidates = [
+    '/run/current-system/sw/bin/chromium',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
     '/usr/bin/google-chrome-stable',
@@ -135,18 +145,13 @@ function getChromiumPath() {
     '/snap/bin/chromium',
   ];
   for (const p of candidates) {
-    if (fs.existsSync(p)) {
-      console.log('🔍 Chromium encontrado en:', p);
-      return p;
-    }
+    if (fs.existsSync(p)) { console.log('🔍 Chromium encontrado en:', p); return p; }
   }
-
-  // 3. Dejar que puppeteer use el bundled Chromium
   console.log('🔍 Usando Chromium bundled de puppeteer');
   return undefined;
 }
 
-// ── Programar reconexión (evita timers duplicados) ───────────────
+// ── Reconexión sin timers duplicados ────────────────────────────
 function scheduleReconnect(delayMs = 8000) {
   if (reconnectTimer) clearTimeout(reconnectTimer);
   console.log(`⏳ Reconectando en ${delayMs / 1000}s...`);
@@ -154,6 +159,25 @@ function scheduleReconnect(delayMs = 8000) {
     reconnectTimer = null;
     createClient();
   }, delayMs);
+}
+
+// ── Verificar horario (Bogotá UTC-5) ────────────────────────────
+function dentroDeHorario() {
+  if (!horario) return true;
+
+  const now = getNowBogota();
+  const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
+  const diaActual = diasMap[now.getUTCDay()];
+  const horaActual = now.getUTCHours() * 60 + now.getUTCMinutes();
+  const [hi, mi] = horario.inicio.split(':').map(Number);
+  const [hf, mf] = horario.fin.split(':').map(Number);
+  const inicio = hi * 60 + mi;
+  const fin = hf * 60 + mf;
+
+  console.log(`🕐 Día: ${diaActual} | Hora Bogotá: ${String(now.getUTCHours()).padStart(2,'0')}:${String(now.getUTCMinutes()).padStart(2,'0')} | Rango: ${horario.inicio}-${horario.fin}`);
+  console.log(`   Días activos: ${horario.dias.join(',')}`);
+
+  return horario.dias.includes(diaActual) && horaActual >= inicio && horaActual <= fin;
 }
 
 // ── Crear cliente WhatsApp ───────────────────────────────────────
@@ -167,15 +191,12 @@ function createClient() {
   console.log('🚀 Creando cliente WhatsApp...');
   killChrome();
 
-  // Pequeña pausa para que el SO libere recursos del proceso anterior
   setTimeout(() => {
     try {
       const executablePath = getChromiumPath();
 
       clientWA = new Client({
-        authStrategy: new LocalAuth({
-          dataPath: '/app/.wwebjs_auth'
-        }),
+        authStrategy: new LocalAuth({ dataPath: '/app/.wwebjs_auth' }),
         puppeteer: {
           headless: true,
           ...(executablePath ? { executablePath } : {}),
@@ -200,8 +221,6 @@ function createClient() {
         }
       });
 
-      // ── Eventos del cliente ──────────────────────────────────
-
       clientWA.on('qr', async (qr) => {
         console.log('📱 QR generado');
         try {
@@ -210,7 +229,7 @@ function createClient() {
           isCreatingClient = false;
           io.emit('update', { qr: lastQR, state: 'qr' });
         } catch (e) {
-          console.error('❌ Error generando QR data URL:', e.message);
+          console.error('❌ Error generando QR:', e.message);
         }
       });
 
@@ -251,7 +270,6 @@ function createClient() {
         scheduleReconnect(5000);
       });
 
-      // ── Manejo de mensajes ───────────────────────────────────
       clientWA.on('message', async (msg) => {
         console.log('────────────────────────────────────────');
         console.log('📨 Mensaje de:', msg.from, '| fromMe:', msg.fromMe, '| botActive:', botActive);
@@ -259,36 +277,25 @@ function createClient() {
         if (msg.fromMe) { console.log('⏭️ Mensaje propio, ignorando'); return; }
         if (!botActive) { console.log('⏸️ Bot pausado'); return; }
 
-        if (horario) {
-          const now = new Date(new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }));
-          const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
-          const diaActual = diasMap[now.getDay()];
-          const horaActual = now.getHours() * 60 + now.getMinutes();
-          const [hi, mi] = horario.inicio.split(':').map(Number);
-          const [hf, mf] = horario.fin.split(':').map(Number);
-          const inicio = hi * 60 + mi;
-          const fin = hf * 60 + mf;
-          console.log(`🕐 Día: ${diaActual} | Hora: ${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')} | Rango: ${horario.inicio}-${horario.fin}`);
-          console.log(`   Días activos: ${horario.dias.join(',')}`);
-          if (!horario.dias.includes(diaActual) || horaActual < inicio || horaActual > fin) {
-            console.log('🕐 Fuera de horario');
-            await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
-            return;
-          }
+        if (!dentroDeHorario()) {
+          console.log('🕐 Fuera de horario, respondiendo...');
+          await msg.reply('Hola, en este momento estamos fuera de horario de atención. Te atenderemos pronto.');
+          return;
         }
 
         const from = msg.from;
         const body = msg.body ? msg.body.trim() : '';
         if (!body) return;
 
+        const horaActual = getTimeBogota();
         if (!conversaciones[from]) conversaciones[from] = [];
-        conversaciones[from].push({ role: 'user', content: body, time: new Date().toLocaleTimeString('es-CO') });
-        io.emit('nuevoMensaje', { from, text: body, role: 'user', time: new Date().toLocaleTimeString('es-CO') });
+        conversaciones[from].push({ role: 'user', content: body, time: horaActual });
+        io.emit('nuevoMensaje', { from, text: body, role: 'user', time: horaActual });
 
         console.log('🤖 Enviando a Groq...');
 
         try {
-          const fechaHoy = new Date().toLocaleDateString('es-CO', { timeZone: 'America/Bogota' });
+          const fechaHoy = getFechaBogota();
           const systemPrompt = `${botInstructions}
 
 REGLAS DE COMPRA:
@@ -306,8 +313,8 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
           let reply = result.choices[0].message.content;
           console.log('✅ Groq respondió, longitud:', reply.length);
 
-          conversaciones[from].push({ role: 'assistant', content: reply, time: new Date().toLocaleTimeString('es-CO') });
-          io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: new Date().toLocaleTimeString('es-CO') });
+          conversaciones[from].push({ role: 'assistant', content: reply, time: horaActual });
+          io.emit('nuevoMensaje', { from, text: reply, role: 'bot', time: horaActual });
 
           if (reply.includes('FACTURA:')) {
             console.log('🧾 Factura detectada');
@@ -341,7 +348,6 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
         console.log('────────────────────────────────────────');
       });
 
-      // ── Inicializar ──────────────────────────────────────────
       clientWA.initialize().catch(err => {
         console.error('❌ Error inicializando cliente:', err.message);
         isCreatingClient = false;
@@ -356,7 +362,7 @@ FACTURA:{"nombre":"...","telefono":"...","correo":"...","producto":"...","precio
       scheduleReconnect(8000);
     }
 
-  }, 3000); // pausa 3s antes de iniciar Chromium
+  }, 3000);
 }
 
 // ── API ──────────────────────────────────────────────────────────
@@ -372,8 +378,6 @@ app.post('/api/configure', async (req, res) => {
   console.log('   serviceNumber:', serviceNumber);
   console.log('   horario:', JSON.stringify(horario));
   await saveConfigToFirebase();
-
-  // Destruir cliente actual y reiniciar
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (clientWA) { try { await clientWA.destroy(); } catch (e) {} clientWA = null; }
   lastQR = null;
@@ -391,7 +395,7 @@ app.get('/api/config', (req, res) => {
   res.json({
     instructions: botInstructions,
     serviceNumber: serviceNumber || '',
-    horario: horario || { dias: ['lun', 'mar', 'mie', 'jue', 'vie', 'sab'], inicio: '09:00', fin: '19:00' }
+    horario: horario || { dias: ['lun', 'mar', 'mie', 'jue', 'vie', 'sab', 'dom'], inicio: '09:00', fin: '19:00' }
   });
 });
 
@@ -428,7 +432,6 @@ app.get('/', (req, res) => {
 // ── Socket.IO ────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('🖥️ Cliente conectado al socket');
-  // Enviar estado actual al cliente recién conectado
   if (lastQR && currentState === 'qr') {
     socket.emit('update', { qr: lastQR, state: 'qr' });
   } else if (currentState === 'ready') {
@@ -439,7 +442,7 @@ io.on('connection', (socket) => {
   socket.emit('configData', {
     instructions: botInstructions,
     serviceNumber: serviceNumber || '',
-    horario: horario || { dias: ['lun', 'mar', 'mie', 'jue', 'vie', 'sab'], inicio: '09:00', fin: '19:00' }
+    horario: horario || { dias: ['lun', 'mar', 'mie', 'jue', 'vie', 'sab', 'dom'], inicio: '09:00', fin: '19:00' }
   });
 });
 
