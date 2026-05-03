@@ -142,7 +142,7 @@ function createClient() {
 
       // Verificar horario
       if (horario) {
-        const now = new Date();
+        const now = const now = new Date(new Date().toLocaleString('es-CO', { timeZone: 'America/Bogota' }));
         const diasMap = { 0: 'dom', 1: 'lun', 2: 'mar', 3: 'mie', 4: 'jue', 5: 'vie', 6: 'sab' };
         const diaActual = diasMap[now.getDay()];
         const horaActual = now.getHours() * 60 + now.getMinutes();
